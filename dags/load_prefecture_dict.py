@@ -3,6 +3,7 @@ from pendulum import datetime
 import pandas as pd
 import pyodbc
 import os
+from airflow.models import Variable
 
 CSV_PATH = "/usr/local/airflow/include/data/prefecture_code.csv"
 
@@ -17,10 +18,10 @@ def load_prefecture_dict():
     @task
     def load_csv_to_sql():
         # --- CONFIG FROM ENV (Airflow Variables / Connections later) ---
-        SERVER = os.environ["DB_SERVER"]
-        DB = os.environ["DB_NAME"]
-        USER = os.environ["DB_USER"]
-        PWD = os.environ["DB_PASSWORD"]
+        SERVER = Variable.get("DB_SERVER")
+        DB     = Variable.get("DB_NAME")
+        USER   = Variable.get("DB_USER")
+        PWD    = Variable.get("DB_PASSWORD")
 
         conn_str = (
             "Driver={ODBC Driver 18 for SQL Server};"

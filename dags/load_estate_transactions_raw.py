@@ -12,9 +12,13 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Pliki CSV są w repo: include/data/*.csv
+# W kontenerze: /usr/local/airflow/include/data/*.csv
 DATA_DIR = "/usr/local/airflow/include/data"
+
+# Jeśli w tym samym folderze masz też prefecture_code.csv,
+# to go odfiltrujemy (i ewentualnie inne nie-transactions).
 EXCLUDE_FILES = {"prefecture_code.csv"}
-BATCH_SIZE = 50_000  # większy batch = mniej commitów
 
 TARGET_COLS = [
     "source_file",
@@ -26,17 +30,32 @@ TARGET_COLS = [
     "Breadth","CityPlanning","CoverageRatio","FloorAreaRatio","Period","Year","Quarter",
     "Renovation","Remarks"
 ]
-INT_COLS = ["No","MunicipalityCode","MinTimeToNearestStation","MaxTimeToNearestStation","TradePrice","Year","Quarter","BuildingYear"]
-FLOAT_COLS = ["Area","UnitPrice","PricePerTsubo","Frontage","TotalFloorArea","CoverageRatio","FloorAreaRatio","Breadth"]
-BIT_COLS = ["AreaIsGreaterFlag","FrontageIsGreaterFlag","TotalFloorAreaIsGreaterFlag","PrewarBuilding"]
+
+INT_COLS = [
+    "No","MunicipalityCode","MinTimeToNearestStation","MaxTimeToNearestStation",
+    "TradePrice","Year","Quarter","BuildingYear"
+]
+FLOAT_COLS = [
+    "Area","UnitPrice","PricePerTsubo","Frontage","TotalFloorArea",
+    "CoverageRatio","FloorAreaRatio","Breadth"
+]
+BIT_COLS = [
+    "AreaIsGreaterFlag","FrontageIsGreaterFlag","TotalFloorAreaIsGreaterFlag","PrewarBuilding"
+]
+
+BATCH_SIZE = 10_000
+
 
 def to_int_safe(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").astype("Int64")
 
+
 def to_float_safe(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
+
 def py_value(x):
+    """Convert pandas/numpy scalars to pure Python types for pyodbc."""
     if pd.isna(x):
         return None
     if isinstance(x, (pd.Timestamp,)):
@@ -45,10 +64,14 @@ def py_value(x):
         return x
     try:
         if hasattr(x, "item"):
-            return x.item()
+            v = x.item()
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                return v
+            return v
     except Exception:
         pass
     return str(x)
+
 
 def build_conn_str(server: str, db: str, user: str, pwd: str) -> str:
     return (
@@ -62,22 +85,50 @@ def build_conn_str(server: str, db: str, user: str, pwd: str) -> str:
         "Connection Timeout=30;"
     )
 
+
 @dag(
     start_date=datetime(2025, 1, 1),
-    schedule=None,
+    schedule=None,   # manual trigger
     catchup=False,
-    max_active_runs=1,
     tags=["etl", "sqlserver", "transactions"],
 )
-def load_transactions_raw_sequential():
+def load_transactions_raw():
 
     @task
-    def load_all_files() -> dict:
+    def list_csv_files() -> list[str]:
         files = sorted(glob(os.path.join(DATA_DIR, "*.csv")))
         files = [f for f in files if os.path.basename(f) not in EXCLUDE_FILES]
-        if not files:
-            raise ValueError(f"No CSV files found in {DATA_DIR} (excluded: {sorted(EXCLUDE_FILES)})")
 
+        if not files:
+            raise ValueError(f"No transaction CSV files found in {DATA_DIR}. "
+                             f"Excluded: {sorted(EXCLUDE_FILES)}")
+
+        log.info("Found %d CSV files in %s", len(files), DATA_DIR)
+        for f in files[:10]:
+            log.info("File: %s", os.path.basename(f))
+        if len(files) > 10:
+            log.info("... and %d more", len(files) - 10)
+
+        return files
+
+    @task
+    def truncate_staging():
+        server = Variable.get("DB_SERVER")
+        db = Variable.get("DB_NAME")
+        user = Variable.get("DB_USER")
+        pwd = Variable.get("DB_PASSWORD")
+
+        cn = pyodbc.connect(build_conn_str(server, db, user, pwd))
+        try:
+            cur = cn.cursor()
+            cur.execute("TRUNCATE TABLE stg.transactions_raw;")
+            cn.commit()
+            log.info("Truncated table stg.transactions_raw")
+        finally:
+            cn.close()
+
+    @task
+    def load_one_file(file_path: str) -> dict:
         server = Variable.get("DB_SERVER")
         db = Variable.get("DB_NAME")
         user = Variable.get("DB_USER")
@@ -85,81 +136,96 @@ def load_transactions_raw_sequential():
 
         conn_str = build_conn_str(server, db, user, pwd)
 
-        start_all = datetime.now()
-        total_rows_all = 0
+        file_name = os.path.basename(file_path)
+        start_ts = datetime.now()
+
+        log.info("==== START file %s ====", file_name)
+        log.info("Reading CSV: %s", file_path)
+
+        df = pd.read_csv(file_path, low_memory=False)
+        df["source_file"] = file_name
+
+        # brakujące kolumny -> NA
+        for c in TARGET_COLS:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[TARGET_COLS]
+
+        # normalizacja typów
+        for c in INT_COLS:
+            df[c] = to_int_safe(df[c])
+        for c in FLOAT_COLS:
+            df[c] = to_float_safe(df[c])
+        for c in BIT_COLS:
+            df[c] = to_int_safe(df[c])
+
+        total = len(df)
+        log.info("File %s rows: %s", file_name, f"{total:,}")
+
+        insert_sql = f"""
+        INSERT INTO stg.transactions_raw ({",".join("["+c+"]" for c in TARGET_COLS)})
+        VALUES ({",".join("?" for _ in TARGET_COLS)})
+        """
 
         cn = pyodbc.connect(conn_str)
         try:
             cur = cn.cursor()
             cur.fast_executemany = True
 
-            # TRUNCATE raz na starcie
-            log.info("Truncating stg.transactions_raw ...")
-            cur.execute("TRUNCATE TABLE stg.transactions_raw;")
-            cn.commit()
+            t0 = datetime.now()
 
-            insert_sql = f"""
-            INSERT INTO stg.transactions_raw ({",".join("["+c+"]" for c in TARGET_COLS)})
-            VALUES ({",".join("?" for _ in TARGET_COLS)})
-            """
+            # batch insert, żeby nie robić ogromnej listy na raz
+            for start in range(0, total, BATCH_SIZE):
+                end = min(start + BATCH_SIZE, total)
+                chunk = df.iloc[start:end]
 
-            for idx, file_path in enumerate(files, start=1):
-                file_name = os.path.basename(file_path)
-                start_file = datetime.now()
+                rows = [
+                    tuple(py_value(v) for v in r)
+                    for r in chunk.itertuples(index=False, name=None)
+                ]
 
-                log.info("==== [%d/%d] START %s ====", idx, len(files), file_name)
+                cur.executemany(insert_sql, rows)
+                cn.commit()
 
-                df = pd.read_csv(file_path, low_memory=False)
-                df["source_file"] = file_name
+                done = end
+                elapsed = (datetime.now() - t0).total_seconds()
+                rps = int(done / elapsed) if elapsed > 0 else 0
 
-                for c in TARGET_COLS:
-                    if c not in df.columns:
-                        df[c] = pd.NA
-                df = df[TARGET_COLS]
+                log.info(
+                    "[%s] progress %s/%s | elapsed %ss | rate %s rows/s",
+                    file_name,
+                    f"{done:,}",
+                    f"{total:,}",
+                    int(elapsed),
+                    f"{rps:,}",
+                )
 
-                for c in INT_COLS:
-                    df[c] = to_int_safe(df[c])
-                for c in FLOAT_COLS:
-                    df[c] = to_float_safe(df[c])
-                for c in BIT_COLS:
-                    df[c] = to_int_safe(df[c])
+            total_elapsed = (datetime.now() - start_ts).total_seconds()
+            log.info("==== DONE file %s | time %ss ====", file_name, int(total_elapsed))
 
-                total = len(df)
-                total_rows_all += total
-                log.info("[%s] rows=%s", file_name, f"{total:,}")
-
-                t0 = datetime.now()
-                done = 0
-                for start in range(0, total, BATCH_SIZE):
-                    end = min(start + BATCH_SIZE, total)
-                    chunk = df.iloc[start:end]
-
-                    rows = [
-                        tuple(py_value(v) for v in r)
-                        for r in chunk.itertuples(index=False, name=None)
-                    ]
-                    cur.executemany(insert_sql, rows)
-                    cn.commit()
-
-                    done = end
-                    elapsed = (datetime.now() - t0).total_seconds()
-                    rps = int(done / elapsed) if elapsed > 0 else 0
-                    log.info("[%s] progress %s/%s | elapsed %ss | rate %s rows/s",
-                             file_name, f"{done:,}", f"{total:,}", int(elapsed), f"{rps:,}")
-
-                file_elapsed = int((datetime.now() - start_file).total_seconds())
-                log.info("==== [%d/%d] DONE %s | time %ss ====", idx, len(files), file_name, file_elapsed)
-
-            all_elapsed = int((datetime.now() - start_all).total_seconds())
-            log.info("===== SUMMARY =====")
-            log.info("Files processed: %d", len(files))
-            log.info("Total rows     : %s", f"{total_rows_all:,}")
-            log.info("Total time (s) : %d", all_elapsed)
-
-            return {"files": len(files), "rows": total_rows_all, "seconds": all_elapsed}
+            return {"file": file_name, "rows": total, "seconds": int(total_elapsed)}
         finally:
             cn.close()
 
-    load_all_files()
+    @task
+    def summarize(results: list[dict]):
+        total_files = len(results)
+        total_rows = sum(r["rows"] for r in results)
+        total_seconds = sum(r["seconds"] for r in results)
 
-load_transactions_raw_sequential()
+        log.info("===== LOAD SUMMARY =====")
+        log.info("Files processed : %d", total_files)
+        log.info("Total rows      : %s", f"{total_rows:,}")
+        log.info("Total time (s)  : %d", total_seconds)
+
+    files = list_csv_files()
+    trunc = truncate_staging()
+
+    # Dynamic mapping: jeden task na plik
+    loads = load_one_file.expand(file_path=files)
+
+    trunc >> loads
+    summarize(loads)
+
+
+load_transactions_raw()

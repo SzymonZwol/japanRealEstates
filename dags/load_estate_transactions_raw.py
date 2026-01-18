@@ -114,7 +114,7 @@ def load_transactions_raw():
             log.info("Truncated stg.transactions_raw")
         finally:
             cn.close()
-
+    
     @task
     def load_one_file(file_path: str) -> dict:
         conn_str = build_conn_str(
@@ -123,88 +123,105 @@ def load_transactions_raw():
             Variable.get("DB_USER"),
             Variable.get("DB_PASSWORD"),
         )
-
+    
         file_name = os.path.basename(file_path)
         start_ts = datetime.now()
-
+    
         log.info("==== START %s ====", file_name)
-
+    
         df = pd.read_csv(file_path, low_memory=False)
         df["source_file"] = file_name
-
+    
         for c in TARGET_COLS:
             if c not in df.columns:
                 df[c] = pd.NA
         df = df[TARGET_COLS]
-
+    
         for c in INT_COLS:
             df[c] = to_int_safe(df[c])
         for c in FLOAT_COLS:
             df[c] = to_float_safe(df[c])
         for c in BIT_COLS:
             df[c] = to_int_safe(df[c])
-
+    
         total = len(df)
         log.info("[%s] rows: %s", file_name, f"{total:,}")
-
+    
         insert_sql = f"""
         INSERT INTO stg.transactions_raw ({",".join("["+c+"]" for c in TARGET_COLS)})
         VALUES ({",".join("?" for _ in TARGET_COLS)})
         """
-
+    
         cn = pyodbc.connect(conn_str)
         try:
             cur = cn.cursor()
             cur.fast_executemany = True
-
+    
             t0 = datetime.now()
             next_heartbeat = t0 + timedelta(seconds=60)
             done = 0
-
+    
             for start in range(0, total, BATCH_SIZE):
                 end = min(start + BATCH_SIZE, total)
+    
+                # heartbeat zanim wejdziemy w potencjalnie długie operacje
+                now = datetime.now()
+                if now >= next_heartbeat:
+                    elapsed = (now - t0).total_seconds()
+                    rps = int(done / elapsed) if elapsed > 0 else 0
+                    log.info(
+                        "[%s] HEARTBEAT %s/%s | elapsed %ss | rate %s rows/s",
+                        file_name,
+                        f"{done:,}",
+                        f"{total:,}",
+                        int(elapsed),
+                        f"{rps:,}",
+                    )
+                    next_heartbeat = now + timedelta(seconds=60)
+    
+                log.info(
+                    "[%s] batch start rows %s-%s (size=%s)",
+                    file_name,
+                    start,
+                    end,
+                    f"{end - start:,}",
+                )
+    
                 chunk = df.iloc[start:end]
-
+    
                 rows = [
                     tuple(py_value(v) for v in r)
                     for r in chunk.itertuples(index=False, name=None)
                 ]
-
+    
+                log.info("[%s] executemany start (rows=%s)", file_name, f"{len(rows):,}")
                 cur.executemany(insert_sql, rows)
+    
+                log.info("[%s] commit start", file_name)
                 cn.commit()
+    
                 done = end
-
-                now = datetime.now()
-
+    
                 # log po batchu
+                now = datetime.now()
                 elapsed = (now - t0).total_seconds()
                 rps = int(done / elapsed) if elapsed > 0 else 0
                 log.info(
-                    "[%s] batch %s/%s | %ss | %s rows/s",
+                    "[%s] batch done %s/%s | elapsed %ss | rate %s rows/s",
                     file_name,
                     f"{done:,}",
                     f"{total:,}",
                     int(elapsed),
                     f"{rps:,}",
                 )
-
-                # heartbeat co minutę
-                if now >= next_heartbeat:
-                    log.info(
-                        "[%s] HEARTBEAT %s/%s | elapsed %ss",
-                        file_name,
-                        f"{done:,}",
-                        f"{total:,}",
-                        int(elapsed),
-                    )
-                    next_heartbeat = now + timedelta(seconds=60)
-
+    
             total_elapsed = int((datetime.now() - start_ts).total_seconds())
             log.info("==== DONE %s | %ss ====", file_name, total_elapsed)
-
+    
             return {"file": file_name, "rows": total, "seconds": total_elapsed}
         finally:
             cn.close()
+
 
     @task
     def summarize(results: list[dict]):

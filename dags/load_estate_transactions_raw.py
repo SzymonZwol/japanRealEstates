@@ -12,8 +12,6 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# Pliki CSV są w repo: include/data/*.csv
-# W kontenerze: /usr/local/airflow/include/data/*.csv
 DATA_DIR = "/usr/local/airflow/include/data"
 
 EXCLUDE_FILES = {"prefecture_code.csv"}
@@ -164,7 +162,6 @@ def load_transactions_raw():
             for start in range(0, total, BATCH_SIZE):
                 end = min(start + BATCH_SIZE, total)
     
-                # heartbeat zanim wejdziemy w potencjalnie długie operacje
                 now = datetime.now()
                 if now >= next_heartbeat:
                     elapsed = (now - t0).total_seconds()

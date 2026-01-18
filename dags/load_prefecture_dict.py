@@ -17,7 +17,6 @@ def load_prefecture_dict():
 
     @task
     def load_csv_to_sql():
-        # --- CONFIG FROM ENV (Airflow Variables / Connections later) ---
         SERVER = Variable.get("DB_SERVER")
         DB     = Variable.get("DB_NAME")
         USER   = Variable.get("DB_USER")
@@ -66,7 +65,6 @@ def load_prefecture_dict():
         )
         cn.commit()
 
-        # test
         cur.execute("SELECT COUNT(*) FROM stg.prefecture_dict;")
         print("Rows loaded:", cur.fetchone()[0])
 

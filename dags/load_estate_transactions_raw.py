@@ -91,6 +91,7 @@ def build_conn_str(server: str, db: str, user: str, pwd: str) -> str:
     schedule=None,   # manual trigger
     catchup=False,
     tags=["etl", "sqlserver", "transactions"],
+    max_active_runs=1
 )
 def load_transactions_raw():
 
@@ -127,7 +128,7 @@ def load_transactions_raw():
         finally:
             cn.close()
 
-    @task
+    @task(pool="ssqlserver_load")
     def load_one_file(file_path: str) -> dict:
         server = Variable.get("DB_SERVER")
         db = Variable.get("DB_NAME")

@@ -79,6 +79,8 @@ def load_dwh_star():
     @task
     def load_dimensions():
         sql = """
+        SET NOCOUNT ON;
+
         -- DIM_CZAS
         INSERT INTO dwh.DIM_CZAS (rok, kwartal)
         SELECT DISTINCT
@@ -86,15 +88,32 @@ def load_dwh_star():
             COALESCE(r.[Quarter], 0) AS kwartal
         FROM stg.transactions_raw r;
 
-        -- DIM_LOKALIZACJA
-        INSERT INTO dwh.DIM_LOKALIZACJA (region, prefektura, gmina_miasto, dzielnica, kod_gminy)
-        SELECT DISTINCT
-            COALESCE(NULLIF(LTRIM(RTRIM(r.[Region])), ''), N'Nieznany')         AS region,
-            COALESCE(NULLIF(LTRIM(RTRIM(r.[Prefecture])), ''), N'Nieznana')     AS prefektura,
-            COALESCE(NULLIF(LTRIM(RTRIM(r.[Municipality])), ''), N'Nieznana')   AS gmina_miasto,
-            COALESCE(NULLIF(LTRIM(RTRIM(r.[DistrictName])), ''), N'Nieznana')   AS dzielnica,
-            COALESCE(r.[MunicipalityCode], -1)                                 AS kod_gminy
-        FROM stg.transactions_raw r;
+        -- DIM_LOKALIZACJA (KANONICZNA NORMALIZACJA + GROUP BY)
+        INSERT INTO dwh.DIM_LOKALIZACJA (prefektura, gmina_miasto, dzielnica, kod_gminy)
+        SELECT
+            prefektura,
+            gmina_miasto,
+            dzielnica,
+            kod_gminy
+        FROM
+        (
+            SELECT
+                UPPER(LTRIM(RTRIM(REPLACE(REPLACE(COALESCE(NULLIF(r.[Prefecture], ''), N'Nieznana'), CHAR(9), ' '), '  ', ' ')))) AS prefektura,
+                UPPER(LTRIM(RTRIM(REPLACE(REPLACE(COALESCE(NULLIF(r.[Municipality], ''), N'Nieznana'), CHAR(9), ' '), '  ', ' ')))) AS gmina_miasto,
+                UPPER(LTRIM(RTRIM(
+                    REPLACE(
+                        REPLACE(
+                            REPLACE(COALESCE(NULLIF(r.[DistrictName], ''), N'Nieznana'), ', ', ','),
+                            CHAR(9), ' '
+                        ),
+                        '  ', ' '
+                    )
+                ))) AS dzielnica,
+                COALESCE(r.[MunicipalityCode], -1) AS kod_gminy
+            FROM stg.transactions_raw r
+        ) s
+        GROUP BY
+            prefektura, gmina_miasto, dzielnica, kod_gminy;
 
         -- DIM_TYP_NIERUCHOMOSCI
         INSERT INTO dwh.DIM_TYP_NIERUCHOMOSCI (typ_nieruchomosci, uklad_pomieszczen, ksztalt_dzialki)
@@ -185,6 +204,8 @@ def load_dwh_star():
     @task
     def load_fact():
         sql = """
+        SET NOCOUNT ON;
+
         INSERT INTO dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI
         (
             czas_id,
@@ -218,10 +239,17 @@ def load_dwh_star():
           ON c.rok = COALESCE(r.[Year], -1)
          AND c.kwartal = COALESCE(r.[Quarter], 0)
         JOIN dwh.DIM_LOKALIZACJA l
-          ON l.region = COALESCE(NULLIF(LTRIM(RTRIM(r.[Region])), ''), N'Nieznany')
-         AND l.prefektura = COALESCE(NULLIF(LTRIM(RTRIM(r.[Prefecture])), ''), N'Nieznana')
-         AND l.gmina_miasto = COALESCE(NULLIF(LTRIM(RTRIM(r.[Municipality])), ''), N'Nieznana')
-         AND l.dzielnica = COALESCE(NULLIF(LTRIM(RTRIM(r.[DistrictName])), ''), N'Nieznana')
+          ON l.prefektura = UPPER(LTRIM(RTRIM(REPLACE(REPLACE(COALESCE(NULLIF(r.[Prefecture], ''), N'Nieznana'), CHAR(9), ' '), '  ', ' '))))
+         AND l.gmina_miasto = UPPER(LTRIM(RTRIM(REPLACE(REPLACE(COALESCE(NULLIF(r.[Municipality], ''), N'Nieznana'), CHAR(9), ' '), '  ', ' '))))
+         AND l.dzielnica = UPPER(LTRIM(RTRIM(
+                REPLACE(
+                    REPLACE(
+                        REPLACE(COALESCE(NULLIF(r.[DistrictName], ''), N'Nieznana'), ', ', ','),
+                        CHAR(9), ' '
+                    ),
+                    '  ', ' '
+                )
+            )))
          AND l.kod_gminy = COALESCE(r.[MunicipalityCode], -1)
         JOIN dwh.DIM_TYP_NIERUCHOMOSCI t
           ON t.typ_nieruchomosci = COALESCE(NULLIF(LTRIM(RTRIM(r.[Type])), ''), N'Nieznany')
@@ -285,13 +313,28 @@ def load_dwh_star():
     @task
     def create_fact_indexes():
         sql = """
-        CREATE INDEX IX_FACT_CZAS              ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (czas_id);
-        CREATE INDEX IX_FACT_LOKALIZACJA       ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (lokalizacja_id);
-        CREATE INDEX IX_FACT_TYP_NIERUCHOMOSCI ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (typ_nieruchomosci_id);
-        CREATE INDEX IX_FACT_BUDYNEK           ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (budynek_id);
-        CREATE INDEX IX_FACT_PRZEZNACZENIE     ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (przeznaczenie_id);
-        CREATE INDEX IX_FACT_DOSTEPNOSC        ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (dostepnosc_id);
-        CREATE INDEX IX_FACT_PLANOWANIE        ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (planowanie_id);
+        SET NOCOUNT ON;
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_CZAS' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_CZAS ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (czas_id);
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_LOKALIZACJA' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_LOKALIZACJA ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (lokalizacja_id);
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_TYP_NIERUCHOMOSCI' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_TYP_NIERUCHOMOSCI ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (typ_nieruchomosci_id);
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_BUDYNEK' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_BUDYNEK ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (budynek_id);
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_PRZEZNACZENIE' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_PRZEZNACZENIE ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (przeznaczenie_id);
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_DOSTEPNOSC' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_DOSTEPNOSC ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (dostepnosc_id);
+
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_FACT_PLANOWANIE' AND object_id = OBJECT_ID('dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI'))
+            CREATE INDEX IX_FACT_PLANOWANIE ON dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI (planowanie_id);
         """
         cn = get_conn()
         cur = cn.cursor()
@@ -304,7 +347,9 @@ def load_dwh_star():
     def counts_check():
         cn = get_conn()
         cur = cn.cursor()
+
         for q in [
+            "SELECT COUNT(*) FROM stg.transactions_raw;",
             "SELECT COUNT(*) FROM dwh.DIM_CZAS;",
             "SELECT COUNT(*) FROM dwh.DIM_LOKALIZACJA;",
             "SELECT COUNT(*) FROM dwh.DIM_TYP_NIERUCHOMOSCI;",
@@ -316,6 +361,16 @@ def load_dwh_star():
         ]:
             cur.execute(q)
             print(q, cur.fetchone()[0])
+
+        # sanity: stg vs fact (czy joiny nie ucinaja)
+        cur.execute("""
+            SELECT
+              (SELECT COUNT(*) FROM stg.transactions_raw) AS stg_cnt,
+              (SELECT COUNT(*) FROM dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI) AS fact_cnt;
+        """)
+        row = cur.fetchone()
+        print("stg_cnt:", row[0], "fact_cnt:", row[1])
+
         cur.close()
         cn.close()
 

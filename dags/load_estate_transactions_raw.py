@@ -128,7 +128,7 @@ def load_transactions_raw():
         finally:
             cn.close()
 
-    @task(pool="ssqlserver_load")
+    @task(pool="sqlserver_load")
     def load_one_file(file_path: str) -> dict:
         server = Variable.get("DB_SERVER")
         db = Variable.get("DB_NAME")

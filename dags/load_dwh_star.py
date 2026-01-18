@@ -56,8 +56,6 @@ def load_dwh_star():
 
     @task
     def truncate_dwh():
-        # FACT - TRUNCATE
-        # DIM - DELETE (bezpieczne przy FK)
         sql = """
         TRUNCATE TABLE dwh.FAKT_TRANSAKCJE_NIERUCHOMOSCI;
 
@@ -362,7 +360,6 @@ def load_dwh_star():
             cur.execute(q)
             print(q, cur.fetchone()[0])
 
-        # sanity: stg vs fact (czy joiny nie ucinaja)
         cur.execute("""
             SELECT
               (SELECT COUNT(*) FROM stg.transactions_raw) AS stg_cnt,
